@@ -1,0 +1,6 @@
+*.pt
+*.ckpt
+*.gz
+*.pth
+
+data/*
