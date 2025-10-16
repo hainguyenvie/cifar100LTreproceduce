@@ -177,7 +177,7 @@ def load_data_from_logits(config):
     dataset = TensorDataset(stacked_logits, labels)
     
     return DataLoader(dataset, batch_size=config['gating_params']['batch_size'], 
-                     shuffle=True, num_workers=4)
+                     shuffle=True, num_workers=4, drop_last=True)  # Drop last incomplete batch for BatchNorm
 
 # ---------------------------- Selective Mode Utilities ---------------------------- #
 
@@ -211,7 +211,11 @@ def load_two_splits_from_logits(config):
             stacked[:, i, :] = torch.load(logit_path, map_location='cpu')
         labels = torch.tensor(np.array(base_ds.targets)[indices])
         dataset = TensorDataset(stacked, labels)
-        out[split_name] = DataLoader(dataset, batch_size=CONFIG['gating_params']['batch_size'], shuffle=True if split_name=='tuneV' else False, num_workers=4)
+        # Drop last batch for training (tuneV) to avoid BatchNorm issues with batch_size=1
+        drop_last = (split_name == 'tuneV')
+        out[split_name] = DataLoader(dataset, batch_size=CONFIG['gating_params']['batch_size'], 
+                                     shuffle=True if split_name=='tuneV' else False, 
+                                     num_workers=4, drop_last=drop_last)
     return out['tuneV'], out['val_lt']
 
 def build_group_priors(expert_names, K, head_boost=1.5, tail_boost=1.5):

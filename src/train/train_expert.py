@@ -215,7 +215,7 @@ def export_logits_for_all_splits(model, expert_name):
         torch.save(all_logits.to(torch.float16), output_dir / f"{split_name}_logits.pt")
         print(f"  Exported {split_name}: {len(indices):,} samples")
     
-    print(f"✅ All logits exported to: {output_dir}")
+    print(f"[OK] All logits exported to: {output_dir}")
 
 # --- CORE TRAINING FUNCTIONS ---
 
@@ -229,8 +229,8 @@ def train_single_expert(expert_key):
     loss_type = expert_config['loss_type']
     
     print(f"\n{'='*60}")
-    print(f"🚀 TRAINING EXPERT: {expert_name.upper()}")
-    print(f"🎯 Loss Type: {loss_type.upper()}")
+    print(f"[TRAIN] EXPERT: {expert_name.upper()}")
+    print(f"[LOSS] Type: {loss_type.upper()}")
     print(f"{'='*60}")
     
     # Setup
@@ -248,10 +248,10 @@ def train_single_expert(expert_key):
     ).to(DEVICE)
     
     criterion = get_loss_function(loss_type, train_loader)
-    print(f"✅ Loss Function: {type(criterion).__name__}")
+    print(f"[OK] Loss Function: {type(criterion).__name__}")
     
     # Print model summary
-    print("📊 Model Architecture:")
+    print("[MODEL] Architecture:")
     model.summary()
     
     # Optimizer and scheduler
@@ -303,37 +303,37 @@ def train_single_expert(expert_key):
         # Save best model
         if val_acc > best_acc:
             best_acc = val_acc
-            print(f"💾 New best! Saving to {best_model_path}")
+            print(f"[SAVE] New best! Saving to {best_model_path}")
             torch.save(model.state_dict(), best_model_path)
     
     # Post-training: Calibration
-    print(f"\n--- 🔧 POST-PROCESSING: {expert_name} ---")
+    print(f"\n--- [POST] POST-PROCESSING: {expert_name} ---")
     model.load_state_dict(torch.load(best_model_path))
     
     scaler = TemperatureScaler()
     optimal_temp = scaler.fit(model, val_loader, DEVICE)
     model.set_temperature(optimal_temp)
-    print(f"✅ Temperature calibration: T = {optimal_temp:.3f}")
+    print(f"[OK] Temperature calibration: T = {optimal_temp:.3f}")
     
     final_model_path = checkpoint_dir / f"final_calibrated_{expert_name}.pth"
     torch.save(model.state_dict(), final_model_path)
     
     # Final validation
     final_acc, final_group_accs = validate_model(model, val_loader, DEVICE)
-    print(f"📊 Final Results - Overall: {final_acc:.2f}%, "
+    print(f"[RESULTS] Final - Overall: {final_acc:.2f}%, "
         f"Head: {final_group_accs['head']:.1f}%, "
         f"Tail: {final_group_accs['tail']:.1f}%")
     
     # Export logits
     export_logits_for_all_splits(model, expert_name)
     
-    print(f"✅ COMPLETED: {expert_name}")
+    print(f"[COMPLETE] {expert_name}")
     return final_model_path
 
 
 def main():
     """Main training script - trains all 3 experts."""
-    print("🚀 AR-GSE Expert Training Pipeline")
+    print("[START] AR-GSE Expert Training Pipeline")
     print(f"Device: {DEVICE}")
     print(f"Dataset: {CONFIG['dataset']['name']}")
     print(f"Experts to train: {list(EXPERT_CONFIGS.keys())}")
@@ -345,16 +345,16 @@ def main():
             model_path = train_single_expert(expert_key)
             results[expert_key] = {'status': 'success', 'path': model_path}
         except Exception as e:
-            print(f"❌ Failed to train {expert_key}: {e}")
+            print(f"[ERROR] Failed to train {expert_key}: {e}")
             results[expert_key] = {'status': 'failed', 'error': str(e)}
             continue
     
     print(f"\n{'='*60}")
-    print("🏁 TRAINING SUMMARY")
+    print("[SUMMARY] TRAINING SUMMARY")
     print(f"{'='*60}")
     
     for expert_key, result in results.items():
-        status = "✅" if result['status'] == 'success' else "❌"
+        status = "[OK]" if result['status'] == 'success' else "[FAIL]"
         print(f"{status} {expert_key}: {result['status']}")
         if result['status'] == 'failed':
             print(f"    Error: {result['error']}")
