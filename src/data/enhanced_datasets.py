@@ -119,8 +119,9 @@ def create_proportional_test_val_with_duplication(
     train_class_counts: List[int],
     val_ratio: float = 0.2,
     tunev_ratio: float = 0.15,
-    seed: int = 42
-) -> Tuple[List[int], List[int], List[int], List[int], List[int], List[int]]:
+    seed: int = 42,
+    create_balanced_test: bool = True
+):
     """
     Create val/tuneV/test sets that match train proportions using duplication when needed.
     
@@ -176,10 +177,11 @@ def create_proportional_test_val_with_duplication(
         np.random.shuffle(cls_indices_in_test)
         
         # Calculate base split sizes (from 100 available per class)
-        # Ensure at least 1 per split and sum to 100
-        n_val_base = max(1, int(round(100 * val_ratio)))
-        n_tunev_base = max(1, int(round(100 * tunev_ratio)))
-        n_test_base = max(1, 100 - n_val_base - n_tunev_base)
+        # Strategy: Maximize test base (since it's final evaluation), smaller val/tuneV bases
+        # We'll use replication to match LT distribution (no downsampling)
+        n_val_base = max(1, int(round(100 * val_ratio)))       # 20 per class
+        n_tunev_base = max(1, int(round(100 * tunev_ratio)))   # 15 per class
+        n_test_base = max(1, 100 - n_val_base - n_tunev_base)  # 65 per class (majority for test)
         
         # Adjust if overflow
         if n_val_base + n_tunev_base + n_test_base > 100:
@@ -212,7 +214,7 @@ def create_proportional_test_val_with_duplication(
         """
         replicated_indices = []
         duplication_stats = {'no_dup': 0, 'duplicated': 0, 'max_dup_factor': 0}
-        
+    
         # Calculate required scaling to maintain IF=100
         # If min_train_count=5, and we want min_split_count=5, then scale=1.0
         # If we want smaller splits, we need at least min_split_count samples for tail
@@ -281,15 +283,50 @@ def create_proportional_test_val_with_duplication(
         
         return replicated_indices, target_counts
     
-    # Use scaling factors - the function will automatically adjust to maintain IF=100
-    val_indices, val_class_counts = replicate_to_exact_proportions(val_base_indices, 0.15, "Val")
-    tunev_indices, tunev_class_counts = replicate_to_exact_proportions(tunev_base_indices, 0.12, "TuneV")
-    test_indices, test_class_counts = replicate_to_exact_proportions(test_base_indices, 0.20, "Test")
+    # CRITICAL DESIGN DECISION: How to "reweight" each split
+    # =========================================================
+    # Based on split purpose and long-tail learning methodology:
+    #
+    # 1. VAL (S2): For plugin optimization (α*, μ*)
+    #    - Needs LT distribution to optimize for real-world deployment
+    #    - Scale: ~20% of train (moderate size, enough for optimization)
+    #
+    # 2. TUNEV (S1): For gating network training
+    #    - Needs LT distribution for gating to learn proper mixture
+    #    - Scale: ~15-20% of train (smaller OK, just for gating)
+    #
+    # 3. TEST-LT: For main evaluation vs papers
+    #    - Needs LT distribution matching train
+    #    - Scale: 100% of train OR maximize base usage
+    #    - Recommendation: Use 1.0 (same size as train) for direct comparison
+    #
+    # 4. TEST-BALANCED (optional): For robustness analysis
+    #    - Keep original balanced distribution
+    #    - Use all available base samples
     
-    # Get targets
+    val_scale = 0.20      # ~20% of train (~2,169 samples) for optimization
+    tunev_scale = 0.20    # ~20% of train (~2,169 samples) for gating training
+    test_lt_scale = 1.0   # 100% of train (~10,847 samples) - FULL SIZE for fair comparison
+    
+    val_indices, val_class_counts = replicate_to_exact_proportions(val_base_indices, val_scale, "Val-LT")
+    tunev_indices, tunev_class_counts = replicate_to_exact_proportions(tunev_base_indices, tunev_scale, "TuneV-LT")
+    test_lt_indices, test_lt_class_counts = replicate_to_exact_proportions(test_base_indices, test_lt_scale, "Test-LT")
+    
+    # Get targets for LT test
     val_targets = test_targets[val_indices].tolist()
     tunev_targets = test_targets[tunev_indices].tolist()
-    test_targets_final = test_targets[test_indices].tolist()
+    test_lt_targets = test_targets[test_lt_indices].tolist()
+    
+    # Optionally create balanced test set (uses all remaining base samples)
+    test_balanced_indices = None
+    test_balanced_targets = None
+    
+    if create_balanced_test:
+        print("\nStep 3: Creating balanced test set (all unique base samples)...")
+        # Use ALL test base indices without replication
+        test_balanced_indices = test_base_indices
+        test_balanced_targets = test_targets[test_balanced_indices].tolist()
+        print(f"  Test-Balanced: {len(test_balanced_indices):,} samples (100% unique, 65 per class)")
     
     # Verify disjoint property (by unique original indices)
     val_unique = set(val_base_indices)
@@ -303,7 +340,16 @@ def create_proportional_test_val_with_duplication(
     print("\n[OK] Verified: All splits are disjoint by original CIFAR-100 indices")
     print("="*60)
     
-    return val_indices, val_targets, tunev_indices, tunev_targets, test_indices, test_targets_final
+    return_dict = {
+        'val': (val_indices, val_targets),
+        'tunev': (tunev_indices, tunev_targets),
+        'test_lt': (test_lt_indices, test_lt_targets),
+    }
+    
+    if create_balanced_test:
+        return_dict['test_balanced'] = (test_balanced_indices, test_balanced_targets)
+    
+    return return_dict
 
 
 def analyze_distribution(indices: List[int], targets: List[int], name: str, train_counts: Optional[List[int]] = None, threshold: int = 20):
@@ -467,7 +513,7 @@ def plot_comprehensive_statistics(all_stats: Dict[str, Dict], output_dir: str):
     # 1. Total samples per split (bar chart)
     ax1 = fig.add_subplot(gs[0, 0])
     totals = [all_stats[name]['total_samples'] for name in split_names]
-    colors = ['#3498db', '#e74c3c', '#2ecc71', '#f39c12']
+    colors = ['#3498db', '#e74c3c', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c']  # Extended for more splits
     bars = ax1.bar(split_names, totals, color=colors[:len(split_names)], alpha=0.7, edgecolor='black')
     ax1.set_ylabel('Total Samples', fontweight='bold')
     ax1.set_title('Total Samples per Split', fontweight='bold', fontsize=12)
@@ -700,7 +746,8 @@ def create_full_cifar100_lt_splits(
     output_dir: str = "data/cifar100_lt_if100_splits", 
     val_ratio: float = 0.2,
     tunev_ratio: float = 0.15,
-    seed: int = 42
+    seed: int = 42,
+    create_balanced_test: bool = True
 ):
     """
     Create complete CIFAR-100-LT dataset splits with SPLIT-FIRST methodology.
@@ -766,19 +813,32 @@ def create_full_cifar100_lt_splits(
         test_base_indices.extend(cls_indices_in_test[n_val_base+n_tunev_base:n_val_base+n_tunev_base+n_test_base])
     
     # Now create the replicated splits
-    val_indices, val_targets, tunev_indices, tunev_targets, test_indices, test_targets = \
-        create_proportional_test_val_with_duplication(
-            cifar_test, train_counts, val_ratio, tunev_ratio, seed
-        )
+    splits_dict = create_proportional_test_val_with_duplication(
+        cifar_test, train_counts, val_ratio, tunev_ratio, seed, create_balanced_test
+    )
+    
+    # Unpack splits
+    val_indices, val_targets = splits_dict['val']
+    tunev_indices, tunev_targets = splits_dict['tunev']
+    test_lt_indices, test_lt_targets = splits_dict['test_lt']
+    
+    # Optionally unpack balanced test
+    if 'test_balanced' in splits_dict:
+        test_balanced_indices, test_balanced_targets = splits_dict['test_balanced']
+    else:
+        test_balanced_indices, test_balanced_targets = None, None
     
     # 3. Analyze all distributions (console output)
     print("\n" + "="*60)
     print("DISTRIBUTION ANALYSIS")
     print("="*60)
-    analyze_distribution(train_indices, train_targets, "TRAIN")
-    analyze_distribution(val_indices, val_targets, "VALIDATION", train_counts)  
-    analyze_distribution(tunev_indices, tunev_targets, "TUNEV", train_counts)
-    analyze_distribution(test_indices, test_targets, "TEST", train_counts)
+    analyze_distribution(train_indices, train_targets, "TRAIN", train_counts, threshold=20)
+    analyze_distribution(val_indices, val_targets, "VAL-LT", train_counts, threshold=20)  
+    analyze_distribution(tunev_indices, tunev_targets, "TUNEV-LT", train_counts, threshold=20)
+    analyze_distribution(test_lt_indices, test_lt_targets, "TEST-LT", train_counts, threshold=20)
+    
+    if test_balanced_indices is not None:
+        analyze_distribution(test_balanced_indices, test_balanced_targets, "TEST-BALANCED", train_counts, threshold=20)
     
     # 4. Compute detailed statistics for visualization
     print("\n" + "="*60)
@@ -791,13 +851,19 @@ def create_full_cifar100_lt_splits(
     all_stats = {
         'Train': compute_split_statistics(train_indices, train_targets, 'Train', 
                                           train_class_counts=train_class_counts_list, threshold=20),
-        'Val': compute_split_statistics(val_indices, val_targets, 'Val', val_base_indices,
+        'Val-LT': compute_split_statistics(val_indices, val_targets, 'Val-LT', val_base_indices,
                                        train_class_counts=train_class_counts_list, threshold=20),
-        'TuneV': compute_split_statistics(tunev_indices, tunev_targets, 'TuneV', tunev_base_indices,
+        'TuneV-LT': compute_split_statistics(tunev_indices, tunev_targets, 'TuneV-LT', tunev_base_indices,
                                          train_class_counts=train_class_counts_list, threshold=20),
-        'Test': compute_split_statistics(test_indices, test_targets, 'Test', test_base_indices,
+        'Test-LT': compute_split_statistics(test_lt_indices, test_lt_targets, 'Test-LT', test_base_indices,
                                         train_class_counts=train_class_counts_list, threshold=20)
     }
+    
+    # Add balanced test if created
+    if test_balanced_indices is not None:
+        all_stats['Test-Bal'] = compute_split_statistics(test_balanced_indices, test_balanced_targets, 
+                                                         'Test-Bal', test_base_indices,
+                                                         train_class_counts=train_class_counts_list, threshold=20)
     
     # Print summary
     for split_name, stats in all_stats.items():
@@ -824,8 +890,12 @@ def create_full_cifar100_lt_splits(
         'train': train_indices,
         'val_lt': val_indices,
         'tuneV': tunev_indices,
-        'test_lt': test_indices
+        'test_lt': test_lt_indices
     }
+    
+    # Add balanced test if created
+    if test_balanced_indices is not None:
+        splits['test_balanced'] = test_balanced_indices
     
     save_splits_to_json(splits, output_dir)
     
@@ -836,17 +906,23 @@ def create_full_cifar100_lt_splits(
         'train': CIFAR100LTDataset(cifar_train, train_indices, train_transform),
         'val': CIFAR100LTDataset(cifar_test, val_indices, eval_transform),
         'tunev': CIFAR100LTDataset(cifar_test, tunev_indices, eval_transform),
-        'test': CIFAR100LTDataset(cifar_test, test_indices, eval_transform)
+        'test_lt': CIFAR100LTDataset(cifar_test, test_lt_indices, eval_transform)
     }
+    
+    if test_balanced_indices is not None:
+        datasets['test_balanced'] = CIFAR100LTDataset(cifar_test, test_balanced_indices, eval_transform)
     
     print("\n" + "=" * 60)
     print("[SUCCESS] DATASET CREATION COMPLETED!")
     print("=" * 60)
     print("Key properties:")
-    print("  [OK] All splits have same long-tail distribution as train (IF=100)")
-    print("  [OK] Val, TuneV, and Test are disjoint by original CIFAR-100 indices")
+    print("  [OK] All LT splits have same distribution as train (IF=100)")
+    print("  [OK] Head/Tail defined by threshold=20 in train")
+    print(f"  [OK] Head: 69 classes (>20 samples), Tail: 31 classes (<=20 samples)")
+    print("  [OK] Val, TuneV, Test-LT are disjoint by original CIFAR-100 indices")
     print("  [OK] Zero data leakage guaranteed")
-    print("  [OK] Follows methodology from 'Learning to Reject Meets Long-tail Learning'")
+    if test_balanced_indices is not None:
+        print("  [OK] Balanced test set created for additional analysis")
     print("\nOutput files:")
     print(f"  * Visualizations: {plot_path}")
     print(f"  * Summary stats: {summary_path}")
@@ -863,7 +939,8 @@ if __name__ == "__main__":
         output_dir="data/cifar100_lt_if100_splits",
         val_ratio=0.2,
         tunev_ratio=0.15,
-        seed=42
+        seed=42,
+        create_balanced_test=True  # Also create balanced test for robustness analysis
     )
     
     print("\nDatasets ready for training:")

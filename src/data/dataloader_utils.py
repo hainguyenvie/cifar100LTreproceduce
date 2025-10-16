@@ -62,12 +62,13 @@ class CIFAR100LTDataModule:
         """Setup all datasets from saved splits."""
         print("Setting up CIFAR-100-LT datasets...")
         
-        # Define split mappings (removed val_small and calib)
+        # Define split mappings
         splits = {
             'train': ('train', self.cifar_train, self.train_transform),
             'val': ('val_lt', self.cifar_test, self.eval_transform),
-            'test': ('test_lt', self.cifar_test, self.eval_transform),
-            'tunev': ('tuneV', self.cifar_test, self.eval_transform)
+            'test': ('test_lt', self.cifar_test, self.eval_transform),  # LT test (main evaluation)
+            'tunev': ('tuneV', self.cifar_test, self.eval_transform),
+            'test_balanced': ('test_balanced', self.cifar_test, self.eval_transform)  # Balanced test (optional)
         }
         
         for split_key, (indices_key, base_dataset, transform) in splits.items():
