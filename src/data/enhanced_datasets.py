@@ -150,20 +150,18 @@ def create_proportional_test_val_with_duplication(
     test_targets = np.array(cifar_test_dataset.targets)
     num_classes = 100
     
-    # Calculate train proportions
+    # Calculate train proportions - these are the exact proportions we must maintain
     total_train = sum(train_class_counts)
     train_proportions = [count / total_train for count in train_class_counts]
     
-    # Target total sizes for each split (after replication)
-    # Scale based on train total to match proportions
-    target_val_total = int(total_train * 0.15)      # ~15% of train size
-    target_tunev_total = int(total_train * 0.12)    # ~12% of train size
-    target_test_total = int(total_train * 0.20)     # ~20% of train size
+    # CRITICAL: To maintain IF=100, we must keep exact class proportions from train
+    # We'll use a scaling factor to determine total size while preserving ratios
+    # The min class in train determines how we can scale
+    min_train_count = min(train_class_counts)
+    max_train_count = max(train_class_counts)
     
-    print(f"Train distribution: {total_train:,} samples")
-    print(f"Target val total: {target_val_total:,}")
-    print(f"Target tuneV total: {target_tunev_total:,}")
-    print(f"Target test total: {target_test_total:,}")
+    print(f"Train distribution: {total_train:,} samples (IF={max_train_count/min_train_count:.1f})")
+    print(f"Train class range: {min_train_count} to {max_train_count} samples per class")
     
     # STEP 1: Split original indices into disjoint base sets (no duplication yet)
     print("\nStep 1: Creating disjoint base splits from original test...")
@@ -201,29 +199,61 @@ def create_proportional_test_val_with_duplication(
     print(f"  Test base (disjoint): {base_counts['test']} samples")
     print(f"  Total base: {sum(base_counts.values())} (should be ~10,000)")
     
-    # STEP 2: Replicate within each split independently to match train proportions
-    print("\nStep 2: Replicating within each split to match train LT distribution...")
+    # STEP 2: Replicate within each split to maintain EXACT IF=100
+    print("\nStep 2: Replicating to maintain IF=100 (same proportions as train)...")
     
-    def replicate_to_match_proportions(base_indices, target_total, split_name):
-        """Replicate base indices to match train proportions for this split."""
+    def replicate_to_exact_proportions(base_indices, scaling_factor, split_name):
+        """
+        Replicate base indices to maintain EXACT train proportions (IF=100).
+        For each class: target_count[cls] = train_class_counts[cls] * adjusted_scaling
+        
+        Key insight: To maintain IF=100, minimum class needs enough samples.
+        We adjust scaling factor to ensure IF=100 is maintained.
+        """
         replicated_indices = []
         duplication_stats = {'no_dup': 0, 'duplicated': 0, 'max_dup_factor': 0}
         
+        # Calculate required scaling to maintain IF=100
+        # If min_train_count=5, and we want min_split_count=5, then scale=1.0
+        # If we want smaller splits, we need at least min_split_count samples for tail
+        # to maintain IF=100: max/min = 100, so if tail=n, head=100n
+        
+        # Compute raw targets
+        raw_targets = [train_class_counts[cls] * scaling_factor for cls in range(num_classes)]
+        min_raw = min([t for t in raw_targets if t > 0]) if any(raw_targets) else 0
+        
+        # To maintain IF=100, ensure minimum class has at least 1 sample after rounding
+        # Then scale everything proportionally
+        if min_raw < 1.0:
+            # Need to scale up to ensure min becomes at least 1.0 before rounding
+            scale_adjustment = 1.0 / min_raw
+            adjusted_scaling = scaling_factor * scale_adjustment
+        else:
+            adjusted_scaling = scaling_factor
+        
+        # Now compute final targets with adjusted scaling
+        target_counts = []
         for cls in range(num_classes):
-            # Get base indices for this class in this split
+            raw_count = train_class_counts[cls] * adjusted_scaling
+            target_count = max(1, int(round(raw_count)))
+            target_counts.append(target_count)
+        
+        # Second pass: actually sample/replicate
+        for cls in range(num_classes):
             base_indices_array = np.array(base_indices)
             base_targets = test_targets[base_indices_array]
             cls_base = base_indices_array[base_targets == cls]
             
             if len(cls_base) == 0:
-                print(f"  ⚠️  Warning: Class {cls} has no base samples in {split_name}")
+                # print(f"  Warning: Class {cls} has no base in {split_name}")
                 continue
             
-            # Target count for this class based on train proportions
-            target_count = max(1, int(round(train_proportions[cls] * target_total)))
+            target_count = target_counts[cls]
+            if target_count == 0:
+                continue
             
             if target_count <= len(cls_base):
-                # Sample without replacement (downsample from base)
+                # Sample without replacement
                 sampled = np.random.choice(cls_base, target_count, replace=False)
                 duplication_stats['no_dup'] += 1
             else:
@@ -232,22 +262,29 @@ def create_proportional_test_val_with_duplication(
                 duplication_stats['max_dup_factor'] = max(duplication_stats['max_dup_factor'], duplication_factor)
                 duplication_stats['duplicated'] += 1
                 
-                # Replicate base and sample
                 duplicated_pool = np.tile(cls_base, duplication_factor)
                 sampled = np.random.choice(duplicated_pool, target_count, replace=False)
             
             replicated_indices.extend(sampled.tolist())
         
-        print(f"  {split_name}: {len(replicated_indices):,} samples "
+        # Verify IF
+        actual_counts = [c for c in target_counts if c > 0]
+        if actual_counts:
+            actual_if = max(actual_counts) / min(actual_counts)
+        else:
+            actual_if = 0
+        
+        print(f"  {split_name}: {len(replicated_indices):,} samples, IF={actual_if:.1f} "
               f"(no_dup: {duplication_stats['no_dup']}, "
               f"duplicated: {duplication_stats['duplicated']}, "
               f"max_factor: {duplication_stats['max_dup_factor']})")
         
-        return replicated_indices
+        return replicated_indices, target_counts
     
-    val_indices = replicate_to_match_proportions(val_base_indices, target_val_total, "Val")
-    tunev_indices = replicate_to_match_proportions(tunev_base_indices, target_tunev_total, "TuneV")
-    test_indices = replicate_to_match_proportions(test_base_indices, target_test_total, "Test")
+    # Use scaling factors - the function will automatically adjust to maintain IF=100
+    val_indices, val_class_counts = replicate_to_exact_proportions(val_base_indices, 0.15, "Val")
+    tunev_indices, tunev_class_counts = replicate_to_exact_proportions(tunev_base_indices, 0.12, "TuneV")
+    test_indices, test_class_counts = replicate_to_exact_proportions(test_base_indices, 0.20, "Test")
     
     # Get targets
     val_targets = test_targets[val_indices].tolist()
@@ -263,14 +300,14 @@ def create_proportional_test_val_with_duplication(
     assert len(val_unique & test_unique) == 0, "Val and Test share base indices!"
     assert len(tunev_unique & test_unique) == 0, "TuneV and Test share base indices!"
     
-    print("\n✅ Verified: All splits are disjoint by original CIFAR-100 indices")
+    print("\n[OK] Verified: All splits are disjoint by original CIFAR-100 indices")
     print("="*60)
     
     return val_indices, val_targets, tunev_indices, tunev_targets, test_indices, test_targets_final
 
 
-def analyze_distribution(indices: List[int], targets: List[int], name: str, train_counts: Optional[List[int]] = None):
-    """Analyze and print distribution statistics."""
+def analyze_distribution(indices: List[int], targets: List[int], name: str, train_counts: Optional[List[int]] = None, threshold: int = 20):
+    """Analyze and print distribution statistics with head/tail based on threshold."""
     print(f"\n=== {name.upper()} DISTRIBUTION ===")
     
     target_counts = Counter(targets)
@@ -286,7 +323,19 @@ def analyze_distribution(indices: List[int], targets: List[int], name: str, trai
     if tail_count > 0:
         print(f"Imbalance factor: {head_count/tail_count:.1f}")
     
-    # Group analysis
+    # Head/Tail analysis based on train threshold
+    if train_counts is not None:
+        head_classes = [i for i in range(100) if train_counts[i] > threshold]
+        tail_classes = [i for i in range(100) if train_counts[i] <= threshold]
+        
+        head_group_count = sum(sorted_counts[i] for i in head_classes)
+        tail_group_count = sum(sorted_counts[i] for i in tail_classes)
+        
+        print(f"\nDistribution by Head/Tail (threshold={threshold} in train):")
+        print(f"  Head (>20 samples, {len(head_classes)} classes): {head_group_count:,} samples ({head_group_count/total*100:.1f}%)")
+        print(f"  Tail (<=20 samples, {len(tail_classes)} classes): {tail_group_count:,} samples ({tail_group_count/total*100:.1f}%)")
+    
+    # Legacy group analysis for reference
     groups = {
         'Head (0-9)': sum(sorted_counts[0:10]),
         'Medium (10-49)': sum(sorted_counts[10:50]), 
@@ -294,7 +343,7 @@ def analyze_distribution(indices: List[int], targets: List[int], name: str, trai
         'Tail (90-99)': sum(sorted_counts[90:100])
     }
     
-    print("Distribution by groups:")
+    print("\nLegacy grouping (by class index):")
     for group_name, group_count in groups.items():
         print(f"  {group_name}: {group_count:,} samples ({group_count/total*100:.1f}%)")
     
@@ -331,16 +380,42 @@ def save_splits_to_json(splits_dict: Dict, output_dir: str):
         print(f"  Saved {split_name}: {len(indices_to_save):,} samples")
 
 def compute_split_statistics(indices: List[int], targets: List[int], name: str, 
-                             base_indices: Optional[List[int]] = None) -> Dict:
-    """Compute comprehensive statistics for a split."""
+                             base_indices: Optional[List[int]] = None,
+                             train_class_counts: Optional[List[int]] = None,
+                             threshold: int = 20) -> Dict:
+    """
+    Compute comprehensive statistics for a split.
+    
+    Head/Tail definition: Based on train set class counts
+    - Head: classes with > threshold samples in train
+    - Tail: classes with <= threshold samples in train
+    """
     target_counts = Counter(targets)
     class_counts = [target_counts.get(i, 0) for i in range(100)]
     
     total = len(indices)
-    head_count = sum(class_counts[:10])
+    
+    # Compute head/tail based on train class counts if provided
+    if train_class_counts is not None:
+        head_classes = [i for i in range(100) if train_class_counts[i] > threshold]
+        tail_classes = [i for i in range(100) if train_class_counts[i] <= threshold]
+        
+        head_count = sum(class_counts[i] for i in head_classes)
+        tail_count = sum(class_counts[i] for i in tail_classes)
+        
+        # Store which classes are head/tail
+        num_head_classes = len(head_classes)
+        num_tail_classes = len(tail_classes)
+    else:
+        # Fallback to arbitrary grouping if train counts not provided
+        head_count = sum(class_counts[:50])
+        tail_count = sum(class_counts[50:100])
+        num_head_classes = 50
+        num_tail_classes = 50
+    
+    # Legacy grouping for backward compatibility (can be used for detailed analysis)
     medium_count = sum(class_counts[10:50])
     low_count = sum(class_counts[50:90])
-    tail_count = sum(class_counts[90:100])
     
     # Compute duplication statistics if base indices provided
     duplication_stats = {}
@@ -362,13 +437,15 @@ def compute_split_statistics(indices: List[int], targets: List[int], name: str,
         'total_samples': total,
         'class_counts': class_counts,
         'head_samples': head_count,
-        'medium_samples': medium_count,
-        'low_samples': low_count,
         'tail_samples': tail_count,
+        'num_head_classes': num_head_classes,
+        'num_tail_classes': num_tail_classes,
+        'medium_samples': medium_count,  # Legacy
+        'low_samples': low_count,  # Legacy
         'head_ratio': head_count / total if total > 0 else 0,
-        'medium_ratio': medium_count / total if total > 0 else 0,
-        'low_ratio': low_count / total if total > 0 else 0,
         'tail_ratio': tail_count / total if total > 0 else 0,
+        'medium_ratio': medium_count / total if total > 0 else 0,  # Legacy
+        'low_ratio': low_count / total if total > 0 else 0,  # Legacy
         'max_class_count': max(class_counts),
         'min_class_count': min(class_counts),
         'imbalance_factor': max(class_counts) / max(1, min(class_counts)),
@@ -402,53 +479,56 @@ def plot_comprehensive_statistics(all_stats: Dict[str, Dict], output_dir: str):
         ax1.text(bar.get_x() + bar.get_width()/2., height,
                 f'{int(height):,}', ha='center', va='bottom', fontweight='bold')
     
-    # 2. Head/Medium/Low/Tail distribution (stacked bar)
+    # 2. Head/Tail distribution (stacked bar) - Based on threshold=20 in train
     ax2 = fig.add_subplot(gs[0, 1])
     head_vals = [all_stats[name]['head_samples'] for name in split_names]
-    medium_vals = [all_stats[name]['medium_samples'] for name in split_names]
-    low_vals = [all_stats[name]['low_samples'] for name in split_names]
     tail_vals = [all_stats[name]['tail_samples'] for name in split_names]
+    
+    # Get number of classes for legend
+    if 'Train' in all_stats:
+        num_head_classes = all_stats['Train'].get('num_head_classes', 0)
+        num_tail_classes = all_stats['Train'].get('num_tail_classes', 0)
+    else:
+        num_head_classes = 0
+        num_tail_classes = 0
     
     x = np.arange(len(split_names))
     width = 0.6
     
-    p1 = ax2.bar(x, head_vals, width, label='Head (0-9)', color='#3498db', alpha=0.8)
-    p2 = ax2.bar(x, medium_vals, width, bottom=head_vals, label='Medium (10-49)', color='#2ecc71', alpha=0.8)
-    p3 = ax2.bar(x, low_vals, width, bottom=np.array(head_vals)+np.array(medium_vals), 
-                label='Low (50-89)', color='#f39c12', alpha=0.8)
-    p4 = ax2.bar(x, tail_vals, width, 
-                bottom=np.array(head_vals)+np.array(medium_vals)+np.array(low_vals),
-                label='Tail (90-99)', color='#e74c3c', alpha=0.8)
+    p1 = ax2.bar(x, head_vals, width, label=f'Head (>20 samples, n={num_head_classes})', color='#3498db', alpha=0.8)
+    p2 = ax2.bar(x, tail_vals, width, bottom=head_vals, 
+                label=f'Tail (<=20 samples, n={num_tail_classes})', color='#e74c3c', alpha=0.8)
     
     ax2.set_ylabel('Number of Samples', fontweight='bold')
-    ax2.set_title('Head/Medium/Low/Tail Distribution', fontweight='bold', fontsize=12)
+    ax2.set_title('Head/Tail Distribution (Threshold=20 in Train)', fontweight='bold', fontsize=12)
     ax2.set_xticks(x)
     ax2.set_xticklabels(split_names)
-    ax2.legend(loc='upper right', framealpha=0.9)
+    ax2.legend(loc='upper right', framealpha=0.9, fontsize=9)
     ax2.grid(axis='y', alpha=0.3)
     
-    # 3. Proportion ratios (grouped bar)
+    # 3. Proportion ratios (grouped bar) - Head vs Tail only
     ax3 = fig.add_subplot(gs[0, 2])
     x = np.arange(len(split_names))
-    bar_width = 0.2
+    bar_width = 0.35
     
     head_ratios = [all_stats[name]['head_ratio'] for name in split_names]
-    medium_ratios = [all_stats[name]['medium_ratio'] for name in split_names]
-    low_ratios = [all_stats[name]['low_ratio'] for name in split_names]
     tail_ratios = [all_stats[name]['tail_ratio'] for name in split_names]
     
-    ax3.bar(x - 1.5*bar_width, head_ratios, bar_width, label='Head', color='#3498db', alpha=0.8)
-    ax3.bar(x - 0.5*bar_width, medium_ratios, bar_width, label='Medium', color='#2ecc71', alpha=0.8)
-    ax3.bar(x + 0.5*bar_width, low_ratios, bar_width, label='Low', color='#f39c12', alpha=0.8)
-    ax3.bar(x + 1.5*bar_width, tail_ratios, bar_width, label='Tail', color='#e74c3c', alpha=0.8)
+    ax3.bar(x - bar_width/2, head_ratios, bar_width, label='Head (>20)', color='#3498db', alpha=0.8, edgecolor='black')
+    ax3.bar(x + bar_width/2, tail_ratios, bar_width, label='Tail (<=20)', color='#e74c3c', alpha=0.8, edgecolor='black')
+    
+    # Add percentage labels on bars
+    for i, (h, t) in enumerate(zip(head_ratios, tail_ratios)):
+        ax3.text(i - bar_width/2, h + 0.02, f'{h*100:.1f}%', ha='center', va='bottom', fontsize=8, fontweight='bold')
+        ax3.text(i + bar_width/2, t + 0.02, f'{t*100:.1f}%', ha='center', va='bottom', fontsize=8, fontweight='bold')
     
     ax3.set_ylabel('Proportion', fontweight='bold')
-    ax3.set_title('Group Proportions by Split', fontweight='bold', fontsize=12)
+    ax3.set_title('Head vs Tail Proportions', fontweight='bold', fontsize=12)
     ax3.set_xticks(x)
     ax3.set_xticklabels(split_names)
     ax3.legend(loc='upper right', framealpha=0.9)
     ax3.grid(axis='y', alpha=0.3)
-    ax3.set_ylim(0, 1.0)
+    ax3.set_ylim(0, max(max(head_ratios), max(tail_ratios)) * 1.2)
     
     # 4. Per-class distribution for each split (line plots)
     ax4 = fig.add_subplot(gs[1, :])
@@ -552,12 +632,12 @@ def plot_comprehensive_statistics(all_stats: Dict[str, Dict], output_dir: str):
     # Save figure
     plot_path = output_path / 'dataset_statistics_comprehensive.png'
     plt.savefig(plot_path, bbox_inches='tight', facecolor='white')
-    print(f"\n📊 Saved comprehensive visualization: {plot_path}")
+    print(f"\n[PLOT] Saved comprehensive visualization: {plot_path}")
     
     # Also save as PDF for publication quality
     pdf_path = output_path / 'dataset_statistics_comprehensive.pdf'
     plt.savefig(pdf_path, bbox_inches='tight', facecolor='white')
-    print(f"📊 Saved PDF version: {pdf_path}")
+    print(f"[PLOT] Saved PDF version: {pdf_path}")
     
     plt.close()
     
@@ -598,7 +678,7 @@ def save_statistics_to_csv(all_stats: Dict[str, Dict], output_dir: str):
     summary_df = pd.DataFrame(summary_data)
     summary_path = output_path / 'split_summary_statistics.csv'
     summary_df.to_csv(summary_path, index=False)
-    print(f"📄 Saved summary statistics: {summary_path}")
+    print(f"[CSV] Saved summary statistics: {summary_path}")
     
     # 2. Per-class distribution
     class_data = []
@@ -611,7 +691,7 @@ def save_statistics_to_csv(all_stats: Dict[str, Dict], output_dir: str):
     class_df = pd.DataFrame(class_data)
     class_path = output_path / 'per_class_distribution.csv'
     class_df.to_csv(class_path, index=False)
-    print(f"📄 Saved per-class distribution: {class_path}")
+    print(f"[CSV] Saved per-class distribution: {class_path}")
     
     return summary_path, class_path
 
@@ -705,11 +785,18 @@ def create_full_cifar100_lt_splits(
     print("COMPUTING COMPREHENSIVE STATISTICS")
     print("="*60)
     
+    # Compute train class counts for threshold-based head/tail definition
+    train_class_counts_list = [Counter(train_targets)[i] for i in range(100)]
+    
     all_stats = {
-        'Train': compute_split_statistics(train_indices, train_targets, 'Train'),
-        'Val': compute_split_statistics(val_indices, val_targets, 'Val', val_base_indices),
-        'TuneV': compute_split_statistics(tunev_indices, tunev_targets, 'TuneV', tunev_base_indices),
-        'Test': compute_split_statistics(test_indices, test_targets, 'Test', test_base_indices)
+        'Train': compute_split_statistics(train_indices, train_targets, 'Train', 
+                                          train_class_counts=train_class_counts_list, threshold=20),
+        'Val': compute_split_statistics(val_indices, val_targets, 'Val', val_base_indices,
+                                       train_class_counts=train_class_counts_list, threshold=20),
+        'TuneV': compute_split_statistics(tunev_indices, tunev_targets, 'TuneV', tunev_base_indices,
+                                         train_class_counts=train_class_counts_list, threshold=20),
+        'Test': compute_split_statistics(test_indices, test_targets, 'Test', test_base_indices,
+                                        train_class_counts=train_class_counts_list, threshold=20)
     }
     
     # Print summary
@@ -717,6 +804,8 @@ def create_full_cifar100_lt_splits(
         print(f"\n{split_name}:")
         print(f"  Total: {stats['total_samples']:,}")
         print(f"  IF: {stats['imbalance_factor']:.2f}")
+        print(f"  Head (>20): {stats['head_samples']:,} samples ({stats['head_ratio']*100:.1f}%) from {stats['num_head_classes']} classes")
+        print(f"  Tail (<=20): {stats['tail_samples']:,} samples ({stats['tail_ratio']*100:.1f}%) from {stats['num_tail_classes']} classes")
         if 'duplication_ratio' in stats:
             print(f"  Duplication: {stats['duplication_ratio']:.2f}x (unique base: {stats['unique_base_samples']})")
     
@@ -751,18 +840,18 @@ def create_full_cifar100_lt_splits(
     }
     
     print("\n" + "=" * 60)
-    print("✅ DATASET CREATION COMPLETED SUCCESSFULLY!")
+    print("[SUCCESS] DATASET CREATION COMPLETED!")
     print("=" * 60)
     print("Key properties:")
-    print("  ✓ All splits have same long-tail distribution as train")
-    print("  ✓ Val, TuneV, and Test are disjoint by original CIFAR-100 indices")
-    print("  ✓ Zero data leakage guaranteed")
-    print("  ✓ Follows methodology from 'Learning to Reject Meets Long-tail Learning'")
-    print("\n📁 Output files:")
-    print(f"  • Visualizations: {plot_path}")
-    print(f"  • Summary stats: {summary_path}")
-    print(f"  • Per-class data: {class_path}")
-    print(f"  • Split indices: {output_dir}/*.json")
+    print("  [OK] All splits have same long-tail distribution as train (IF=100)")
+    print("  [OK] Val, TuneV, and Test are disjoint by original CIFAR-100 indices")
+    print("  [OK] Zero data leakage guaranteed")
+    print("  [OK] Follows methodology from 'Learning to Reject Meets Long-tail Learning'")
+    print("\nOutput files:")
+    print(f"  * Visualizations: {plot_path}")
+    print(f"  * Summary stats: {summary_path}")
+    print(f"  * Per-class data: {class_path}")
+    print(f"  * Split indices: {output_dir}/*.json")
     print("=" * 60)
     
     return datasets, splits
