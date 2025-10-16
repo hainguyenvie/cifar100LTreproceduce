@@ -747,33 +747,40 @@ def create_full_cifar100_lt_splits(
     val_ratio: float = 0.2,
     tunev_ratio: float = 0.15,
     seed: int = 42,
-    create_balanced_test: bool = True
+    create_balanced_test: bool = True,
+    use_evaluation_reweighting: bool = False
 ):
     """
-    Create complete CIFAR-100-LT dataset splits with SPLIT-FIRST methodology.
+    Create complete CIFAR-100-LT dataset splits with flexible reweighting strategies.
     
-    All splits (val, tuneV, test) have the same long-tail distribution as train.
-    Guarantees zero leakage by splitting original indices first, then replicating.
-    
-    Following "Learning to Reject Meets Long-tail Learning" (Cao et al., 2024):
-    - Train: Long-tail with exponential imbalance
-    - Val/TuneV/Test: Match train's long-tail proportions via replication
-    - All splits are disjoint by original CIFAR-100 test indices
+    Two modes:
+    1. Physical Replication (use_evaluation_reweighting=False):
+       - Replicate samples to match train's LT distribution
+       - Test/val have same IF=100 as train
+       
+    2. Evaluation Reweighting (use_evaluation_reweighting=True):
+       - Keep all splits BALANCED (no duplication)
+       - Save train class weights for weighted loss/metrics
+       - More common in research, preserves all unique data
     
     Args:
         imb_factor: Imbalance factor for training set (default 100)
         output_dir: Directory to save split indices
-        val_ratio: Base proportion for validation (default 0.2 = 20% of original test)
-        tunev_ratio: Base proportion for tuneV (default 0.15 = 15% of original test)
+        val_ratio: Base proportion for validation (default 0.2)
+        tunev_ratio: Base proportion for tuneV (default 0.15)
         seed: Random seed for reproducibility
+        create_balanced_test: Create additional balanced test set
+        use_evaluation_reweighting: If True, keep val/tuneV/test balanced and use weighted metrics
         
     Returns:
-        Tuple of (datasets, splits) where datasets contains train/val/test/tunev Dataset objects
-        and splits contains the indices for each split
+        Tuple of (datasets, splits)
     """
     print("=" * 60)
     print("CREATING CIFAR-100-LT DATASET SPLITS (SPLIT-FIRST)")  
-    print("Following 'Learning to Reject Meets Long-tail Learning' methodology")
+    if use_evaluation_reweighting:
+        print("Mode: EVALUATION REWEIGHTING (balanced splits + weighted metrics)")
+    else:
+        print("Mode: PHYSICAL REPLICATION (LT splits with sample duplication)")
     print("=" * 60)
     
     # Load original CIFAR-100
@@ -812,21 +819,48 @@ def create_full_cifar100_lt_splits(
         tunev_base_indices.extend(cls_indices_in_test[n_val_base:n_val_base+n_tunev_base])
         test_base_indices.extend(cls_indices_in_test[n_val_base+n_tunev_base:n_val_base+n_tunev_base+n_test_base])
     
-    # Now create the replicated splits
-    splits_dict = create_proportional_test_val_with_duplication(
-        cifar_test, train_counts, val_ratio, tunev_ratio, seed, create_balanced_test
-    )
-    
-    # Unpack splits
-    val_indices, val_targets = splits_dict['val']
-    tunev_indices, tunev_targets = splits_dict['tunev']
-    test_lt_indices, test_lt_targets = splits_dict['test_lt']
-    
-    # Optionally unpack balanced test
-    if 'test_balanced' in splits_dict:
-        test_balanced_indices, test_balanced_targets = splits_dict['test_balanced']
+    # MODE SWITCH: Evaluation reweighting vs physical replication
+    if use_evaluation_reweighting:
+        print("\n[MODE] Using EVALUATION REWEIGHTING - all splits kept BALANCED")
+        print("  Val/TuneV/Test will use ALL unique base samples (no duplication)")
+        print("  Train class weights will be saved for weighted loss/metrics")
+        
+        # Use base indices directly (balanced)
+        val_indices = val_base_indices
+        val_targets = test_targets_array[val_indices].tolist()
+        
+        tunev_indices = tunev_base_indices
+        tunev_targets = test_targets_array[tunev_indices].tolist()
+        
+        test_lt_indices = test_base_indices
+        test_lt_targets = test_targets_array[test_lt_indices].tolist()
+        
+        test_balanced_indices = None
+        test_balanced_targets = None
+        
+        print(f"\n  Val: {len(val_indices):,} samples (balanced, 20 per class)")
+        print(f"  TuneV: {len(tunev_indices):,} samples (balanced, 15 per class)")
+        print(f"  Test: {len(test_lt_indices):,} samples (balanced, 65 per class)")
+        print("  [INFO] No duplication - all unique samples")
+        
     else:
-        test_balanced_indices, test_balanced_targets = None, None
+        # Original physical replication mode
+        print("\n[MODE] Using PHYSICAL REPLICATION - splits match train LT distribution")
+        
+        splits_dict = create_proportional_test_val_with_duplication(
+            cifar_test, train_counts, val_ratio, tunev_ratio, seed, create_balanced_test
+        )
+        
+        # Unpack splits
+        val_indices, val_targets = splits_dict['val']
+        tunev_indices, tunev_targets = splits_dict['tunev']
+        test_lt_indices, test_lt_targets = splits_dict['test_lt']
+        
+        # Optionally unpack balanced test
+        if 'test_balanced' in splits_dict:
+            test_balanced_indices, test_balanced_targets = splits_dict['test_balanced']
+        else:
+            test_balanced_indices, test_balanced_targets = None, None
     
     # 3. Analyze all distributions (console output)
     print("\n" + "="*60)
@@ -898,6 +932,32 @@ def create_full_cifar100_lt_splits(
         splits['test_balanced'] = test_balanced_indices
     
     save_splits_to_json(splits, output_dir)
+    
+    # Save train class weights for evaluation reweighting
+    train_class_counts_list = [Counter(train_targets)[i] for i in range(100)]
+    total_train = sum(train_class_counts_list)
+    
+    # Compute sample weights: weight_i = freq(class_i) / total
+    # These weights sum to 1.0 and represent class proportions
+    class_weights = [count / total_train for count in train_class_counts_list]
+    
+    weights_info = {
+        'class_counts': train_class_counts_list,
+        'class_weights': class_weights,  # Proportions (sum to 1.0)
+        'total_samples': total_train,
+        'imbalance_factor': max(train_class_counts_list) / min(train_class_counts_list),
+        'mode': 'evaluation_reweighting' if use_evaluation_reweighting else 'physical_replication',
+        'threshold': 20,
+        'head_classes': [i for i in range(100) if train_class_counts_list[i] > 20],
+        'tail_classes': [i for i in range(100) if train_class_counts_list[i] <= 20]
+    }
+    
+    weights_path = Path(output_dir) / 'train_class_weights.json'
+    with open(weights_path, 'w') as f:
+        json.dump(weights_info, f, indent=2)
+    print(f"\n[WEIGHTS] Saved train class weights: {weights_path}")
+    if use_evaluation_reweighting:
+        print("  [INFO] Use these weights for weighted loss/metrics in training/evaluation")
     
     # 8. Create dataset objects with transforms
     train_transform, eval_transform = get_cifar100_transforms()

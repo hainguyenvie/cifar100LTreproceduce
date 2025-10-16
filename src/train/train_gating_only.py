@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from src.models.argse import AR_GSE
 from src.data.groups import get_class_to_group_by_threshold
 from src.data.datasets import get_cifar100_lt_counts
+from src.data.reweighting_utils import load_train_class_weights, get_sample_weights
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -24,6 +25,7 @@ CONFIG = {
         'name': 'cifar100_lt_if100',
         'splits_dir': './data/cifar100_lt_if100_splits',
         'num_classes': 100,
+        'use_evaluation_reweighting': True,  # Enable evaluation reweighting
     },
     'grouping': {
         'threshold': 20,
@@ -95,15 +97,26 @@ def gating_diversity_regularizer(gating_weights, mode="usage_balance"):
     return torch.sum(p_bar * torch.log(p_bar * gating_weights.size(1)))
 
 def mixture_cross_entropy_loss(expert_logits, labels, gating_weights, sample_weights=None, 
-                            entropy_penalty=0.0, diversity_penalty=0.0):
+                            entropy_penalty=0.0, diversity_penalty=0.0, 
+                            class_weights=None, use_evaluation_reweighting=False):
     """
-    Enhanced cross-entropy loss with diversity promotion.
+    Enhanced cross-entropy loss with diversity promotion and evaluation reweighting support.
+    
     L = -log(Σ_e w_e * softmax(logits_e)[y]) + entropy_penalty * H(gating_weights) + diversity_penalty * D(gating)
+    
+    Args:
+        expert_logits: [B, E, C] expert logits
+        labels: [B] ground truth labels
+        gating_weights: [B, E] gating mixture weights
+        sample_weights: [B] optional explicit sample weights
+        entropy_penalty: coefficient for gating entropy regularization
+        diversity_penalty: coefficient for expert usage balance
+        class_weights: list of class proportions from train (for evaluation reweighting)
+        use_evaluation_reweighting: if True, apply class frequency weights
     """
     # expert_logits: [B, E, C]
     # gating_weights: [B, E]  
     # labels: [B]
-    # sample_weights: [B] optional
     
     expert_probs = torch.softmax(expert_logits, dim=-1)  # [B, E, C]
     mixture_probs = torch.einsum('be,bec->bc', gating_weights, expert_probs)  # [B, C]
@@ -115,11 +128,19 @@ def mixture_cross_entropy_loss(expert_logits, labels, gating_weights, sample_wei
     log_probs = torch.log(mixture_probs)  # [B, C]
     nll = torch.nn.functional.nll_loss(log_probs, labels, reduction='none')  # [B]
     
-    # Apply sample weights if provided
-    if sample_weights is not None:
+    # Apply weights (evaluation reweighting or custom sample weights)
+    if use_evaluation_reweighting and class_weights is not None:
+        # Apply class frequency weights from training
+        eval_weights = get_sample_weights(labels, class_weights, device=expert_logits.device)
+        nll = nll * eval_weights
+        ce_loss = nll.sum() / eval_weights.sum()  # Normalize by weight sum
+    elif sample_weights is not None:
+        # Apply custom sample weights
         nll = nll * sample_weights
-    
-    ce_loss = nll.mean()
+        ce_loss = nll.mean()
+    else:
+        # Unweighted loss
+        ce_loss = nll.mean()
     
     # Add entropy penalty to encourage diversity in gating weights
     entropy_loss = 0.0
@@ -410,8 +431,12 @@ def evaluate_split(eta, y, alpha, mu, t, class_to_group, K, objective='worst'):
         else:
             return float(max(errs)), errs
 
-def selective_losses_with_pinball(expert_logits, labels, model, alpha, mu, t_param, cfg_sel, class_to_group, pi_by_group):
-    """Compute all selective-training losses including learnable per-group thresholds with Pinball Loss."""
+def selective_losses_with_pinball(expert_logits, labels, model, alpha, mu, t_param, cfg_sel, class_to_group, pi_by_group, class_weights=None):
+    """Compute all selective-training losses including learnable per-group thresholds with Pinball Loss.
+    
+    Args:
+        class_weights: Optional list of class proportions from train for evaluation reweighting
+    """
     eps = cfg_sel['eps']
     device = expert_logits.device
     
@@ -438,8 +463,12 @@ def selective_losses_with_pinball(expert_logits, labels, model, alpha, mu, t_par
     q = q / (q.sum(dim=1, keepdim=True) + eps)
     ce = F.nll_loss(torch.log(q + eps), labels, reduction='none')  # [B]
 
-    # Tail-aware weighting in L_sel
-    if len(cfg_sel.get('tau_by_group', [])) == 2 and cfg_sel.get('beta_tail', 1.0) != 1.0:
+    # Apply evaluation reweighting if class_weights provided
+    if class_weights is not None:
+        eval_weights = get_sample_weights(labels, class_weights, device=device)
+        L_sel = (s * ce * eval_weights).sum() / (s * eval_weights).sum().clamp_min(eps)
+    # Tail-aware weighting in L_sel (legacy, for physical replication mode)
+    elif len(cfg_sel.get('tau_by_group', [])) == 2 and cfg_sel.get('beta_tail', 1.0) != 1.0:
         beta_tail = cfg_sel['beta_tail']
         sample_w = torch.where(y_groups == 1, torch.tensor(beta_tail, device=device), torch.tensor(1.0, device=device))
         L_sel = (s * ce * sample_w).sum() / (s * sample_w).sum().clamp_min(eps)
@@ -563,6 +592,22 @@ def run_selective_mode():
     # Load splits
     S1_loader, S2_loader = load_two_splits_from_logits(CONFIG)
     print(f"Loaded S1 (tuneV) batches: {len(S1_loader)} | S2 (val_lt) batches: {len(S2_loader)}")
+    
+    # Load class weights for evaluation reweighting (if enabled)
+    class_weights = None
+    use_eval_reweight = CONFIG['dataset'].get('use_evaluation_reweighting', False)
+    
+    if use_eval_reweight:
+        try:
+            from src.data.reweighting_utils import load_train_class_weights
+            weights_info = load_train_class_weights(CONFIG['dataset']['splits_dir'])
+            class_weights = weights_info['class_weights']
+            print(f"[REWEIGHT] Loaded train class weights for selective training")
+            print(f"  Mode: {weights_info['mode']}")
+            print(f"  Weight ratio: {class_weights[0]/class_weights[99]:.1f}x")
+        except Exception as e:
+            print(f"[WARNING] Could not load class weights: {e}")
+            use_eval_reweight = False
 
     # Calibrate expert temperatures on S1 before any training
     print("\n-- Temperature Calibration --")
@@ -686,7 +731,7 @@ def run_selective_mode():
                 # Use pinball loss for learning thresholds
                 total_loss, diagnostics, m_raw_detached, s_detached = selective_losses_with_pinball(
                     expert_logits, labels, model, alpha, mu, t_param, CONFIG['selective'], 
-                    class_to_group.to(DEVICE), pi_by_group
+                    class_to_group.to(DEVICE), pi_by_group, class_weights=class_weights
                 )
                 
                 # Extract values from diagnostics for compatibility
@@ -815,7 +860,25 @@ def train_gating_only():
     
     # Load data
     train_loader = load_data_from_logits(CONFIG)
-    print(f"✅ Loaded training data: {len(train_loader)} batches")
+    print(f"[OK] Loaded training data: {len(train_loader)} batches")
+    
+    # Load class weights for evaluation reweighting (if enabled)
+    class_weights = None
+    use_eval_reweight = CONFIG['dataset'].get('use_evaluation_reweighting', False)
+    
+    if use_eval_reweight:
+        try:
+            from src.data.reweighting_utils import load_train_class_weights
+            weights_info = load_train_class_weights(CONFIG['dataset']['splits_dir'])
+            class_weights = weights_info['class_weights']
+            print(f"[REWEIGHT] Loaded train class weights (mode: {weights_info['mode']})")
+            print(f"  Head classes (>20): {len(weights_info['head_classes'])}")
+            print(f"  Tail classes (<=20): {len(weights_info['tail_classes'])}")
+            print(f"  Weight ratio (class 0 / class 99): {class_weights[0]/class_weights[99]:.1f}")
+        except Exception as e:
+            print(f"[WARNING] Could not load class weights: {e}")
+            print(f"  Falling back to unweighted training")
+            use_eval_reweight = False
     
     # Get split counts from tuneV for sample weighting (không phải full counts)
     cifar_train_full = torchvision.datasets.CIFAR100(root='./data', train=True, download=False)
@@ -904,10 +967,19 @@ def train_gating_only():
                                                     torch.tensor(tail_weight, device=DEVICE))
             
             # Mixture cross-entropy loss with sample weights, entropy penalty, and diversity penalty
-            loss = mixture_cross_entropy_loss(expert_logits, labels, gating_weights, 
-                                            sample_weights, 
-                                            entropy_penalty=CONFIG['gating_params']['entropy_penalty'],
-                                            diversity_penalty=CONFIG['gating_params']['diversity_penalty'])
+            # If evaluation reweighting is enabled, use class_weights; otherwise use sample_weights
+            if use_eval_reweight:
+                loss = mixture_cross_entropy_loss(expert_logits, labels, gating_weights, 
+                                                sample_weights=None,  # Don't use frequency weighting
+                                                entropy_penalty=CONFIG['gating_params']['entropy_penalty'],
+                                                diversity_penalty=CONFIG['gating_params']['diversity_penalty'],
+                                                class_weights=class_weights,
+                                                use_evaluation_reweighting=True)
+            else:
+                loss = mixture_cross_entropy_loss(expert_logits, labels, gating_weights, 
+                                                sample_weights, 
+                                                entropy_penalty=CONFIG['gating_params']['entropy_penalty'],
+                                                diversity_penalty=CONFIG['gating_params']['diversity_penalty'])
             
             loss.backward()
             # Apply gradient clipping if specified

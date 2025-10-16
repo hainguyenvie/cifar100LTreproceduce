@@ -38,6 +38,8 @@ if __name__ == '__main__':
         'alpha_steps': 4,           # Alpha fixed-point steps
         'gamma': 0.25,             # EMA factor
     })
+    # Ensure evaluation reweighting is enabled across the run
+    CONFIG['dataset']['use_evaluation_reweighting'] = True
     
     # Update output directory for improved results
     CONFIG['output']['checkpoints_dir'] = './checkpoints/argse_worst_eg_improved/'

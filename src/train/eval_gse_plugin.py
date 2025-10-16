@@ -20,6 +20,7 @@ from src.metrics.bootstrap import bootstrap_ci
 
 # Import plugin functions
 from src.train.gse_balanced_plugin import compute_margin
+from src.data.reweighting_utils import load_train_class_weights, get_sample_weights
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -28,6 +29,7 @@ CONFIG = {
         'name': 'cifar100_lt_if100',
         'splits_dir': './data/cifar100_lt_if100_splits',
         'num_classes': 100,
+        'use_evaluation_reweighting': True,  # Enable evaluation reweighting
     },
     'grouping': {
         'threshold': 20,
@@ -219,7 +221,7 @@ def selective_risk_from_mask(preds, labels, accepted_mask, c_cost, class_to_grou
             worst = max(worst, risk_k)
         return worst
 
-def compute_group_risk_for_aurc(preds, labels, accepted_mask, class_to_group, K, metric_type="balanced"):
+def compute_group_risk_for_aurc(preds, labels, accepted_mask, class_to_group, K, metric_type="balanced", class_weights=None):
     """
     Compute group-aware risk for AURC evaluation.
     
@@ -242,8 +244,11 @@ def compute_group_risk_for_aurc(preds, labels, accepted_mask, class_to_group, K,
     
     if metric_type == 'standard':
         # Standard error (overall accuracy on accepted)
-        correct = (preds[accepted_mask] == y[accepted_mask])
-        return 1.0 - correct.float().mean().item()
+        correct = (preds[accepted_mask] == y[accepted_mask]).float()
+        if class_weights is not None and accepted_mask.sum() > 0:
+            sample_w = get_sample_weights(y[accepted_mask], class_weights, device=correct.device)
+            return 1.0 - (correct * sample_w).sum().item() / sample_w.sum().item()
+        return 1.0 - correct.mean().item()
     
     # Group-aware metrics
     group_errors = []
@@ -254,8 +259,13 @@ def compute_group_risk_for_aurc(preds, labels, accepted_mask, class_to_group, K,
         if group_accepted.sum() == 0:
             group_errors.append(1.0)  # No accepted samples in this group
         else:
-            group_correct = (preds[group_accepted] == y[group_accepted])
-            group_error = 1.0 - group_correct.float().mean().item()
+            group_correct = (preds[group_accepted] == y[group_accepted]).float()
+            if class_weights is not None:
+                sample_w = get_sample_weights(y[group_accepted], class_weights, device=group_correct.device)
+                group_acc = (group_correct * sample_w).sum() / sample_w.sum()
+                group_error = 1.0 - group_acc.item()
+            else:
+                group_error = 1.0 - group_correct.mean().item()
             group_errors.append(group_error)
     
     if metric_type == 'balanced':
@@ -266,7 +276,7 @@ def compute_group_risk_for_aurc(preds, labels, accepted_mask, class_to_group, K,
         raise ValueError(f"Unknown metric type: {metric_type}")
 
 def find_optimal_threshold_for_cost(confidence_scores, preds, labels, class_to_group, K, 
-                                   cost_c, metric_type="balanced"):
+                                   cost_c, metric_type="balanced", class_weights=None):
     """
     Find optimal threshold that minimizes: risk + c * (1 - coverage)
     
@@ -295,7 +305,7 @@ def find_optimal_threshold_for_cost(confidence_scores, preds, labels, class_to_g
     for threshold in thresholds:
         accepted = confidence_scores >= threshold
         coverage = accepted.float().mean().item()
-        risk = compute_group_risk_for_aurc(preds, labels, accepted, class_to_group, K, metric_type)
+        risk = compute_group_risk_for_aurc(preds, labels, accepted, class_to_group, K, metric_type, class_weights=class_weights)
         
         # Objective: risk + c * rejection_rate
         objective = risk + cost_c * (1.0 - coverage)
@@ -308,7 +318,7 @@ def find_optimal_threshold_for_cost(confidence_scores, preds, labels, class_to_g
 
 def sweep_cost_values_aurc(confidence_scores_val, preds_val, labels_val, 
                           confidence_scores_test, preds_test, labels_test,
-                          class_to_group, K, cost_values, metric_type="balanced"):
+                          class_to_group, K, cost_values, metric_type="balanced", class_weights=None):
     """
     Sweep cost values and return (cost, coverage, risk) points on test set.
     
@@ -334,14 +344,14 @@ def sweep_cost_values_aurc(confidence_scores_val, preds_val, labels_val,
     for i, cost_c in enumerate(cost_values):
         # Find optimal threshold on validation
         optimal_threshold = find_optimal_threshold_for_cost(
-            confidence_scores_val, preds_val, labels_val, class_to_group, K, cost_c, metric_type
+            confidence_scores_val, preds_val, labels_val, class_to_group, K, cost_c, metric_type, class_weights=class_weights
         )
         
         # Apply to test set
         accepted_test = confidence_scores_test >= optimal_threshold
         coverage_test = accepted_test.float().mean().item()
         risk_test = compute_group_risk_for_aurc(preds_test, labels_test, accepted_test, 
-                                               class_to_group, K, metric_type)
+                                               class_to_group, K, metric_type, class_weights=class_weights)
         
         rc_points.append((cost_c, coverage_test, risk_test))
         
@@ -401,7 +411,7 @@ def compute_aurc_from_points(rc_points, coverage_range='full'):
     aurc = np.trapz(risks, coverages)
     return aurc
 
-def evaluate_aurc_comprehensive(eta_mix, preds, labels, class_to_group, K, output_dir):
+def evaluate_aurc_comprehensive(eta_mix, preds, labels, class_to_group, K, output_dir, class_weights=None):
     """
     Comprehensive AURC evaluation following "Learning to Reject Meets Long-tail Learning" methodology.
     
@@ -462,7 +472,7 @@ def evaluate_aurc_comprehensive(eta_mix, preds, labels, class_to_group, K, outpu
         rc_points = sweep_cost_values_aurc(
             confidence_val, preds_val, labels_val,
             confidence_test, preds_test, labels_test,
-            class_to_group, K, cost_values, metric
+            class_to_group, K, cost_values, metric, class_weights=class_weights
         )
         
         # Compute AURC for full range [0, 1]
@@ -728,6 +738,23 @@ def main():
     results['aurc_worst_02_10'] = aurc_wst_02
     print(f"AURC 0.2-1.0 (Balanced): {aurc_bal_02:.4f}, AURC 0.2-1.0 (Worst): {aurc_wst_02:.4f}")
     
+    # 5.3 Weighted vs Unweighted AURC (standard metric) using reweighting if enabled
+    class_weights = None
+    if CONFIG['dataset'].get('use_evaluation_reweighting', False):
+        try:
+            weights_info = load_train_class_weights(CONFIG['dataset']['splits_dir'])
+            class_weights = weights_info['class_weights']
+            print("[REWEIGHT] Loaded train class weights for evaluation metrics")
+        except Exception as e:
+            print(f"[WARNING] Failed to load class weights: {e}")
+            class_weights = None
+
+    # Compute comprehensive weighted AURC following the methodology section
+    aurc_results_comp, rc_points_comp = evaluate_aurc_comprehensive(
+        eta_mix, preds, test_labels, class_to_group_cpu, num_groups, output_dir, class_weights=class_weights
+    )
+    results['aurc_comprehensive'] = aurc_results_comp
+
     # 5.3 Bootstrap CI for AURC
     def aurc_metric_func(m, p, labels):
         rc_df_boot = generate_rc_curve(m, p, labels, class_to_group_cpu, num_groups, num_points=51)

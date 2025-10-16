@@ -15,6 +15,7 @@ import torchvision
 from src.models.argse import AR_GSE
 from src.data.groups import get_class_to_group_by_threshold
 from src.data.datasets import get_cifar100_lt_counts
+from src.data.reweighting_utils import load_train_class_weights, get_sample_weights
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -24,6 +25,7 @@ CONFIG = {
         'name': 'cifar100_lt_if100',
         'splits_dir': './data/cifar100_lt_if100_splits',
         'num_classes': 100,
+        'use_evaluation_reweighting': True,  # Enable evaluation reweighting
     },
     'grouping': {
         'threshold': 20,  # classes with >threshold samples are head
@@ -133,9 +135,12 @@ def accepted_and_pred(eta, alpha, mu, c, class_to_group):
     preds = (alpha[class_to_group] * eta).argmax(dim=1)
     return accepted, preds, margin
 
-def balanced_error_on_S(eta, y, alpha, mu, c, class_to_group, K):
+def balanced_error_on_S(eta, y, alpha, mu, c, class_to_group, K, class_weights=None):
     """
     Compute balanced error rate on a split S.
+    
+    Args:
+        class_weights: Optional class frequency weights for evaluation reweighting
     
     Returns:
         bal_error: balanced error (average of per-group errors)
@@ -156,14 +161,25 @@ def balanced_error_on_S(eta, y, alpha, mu, c, class_to_group, K):
             # No accepted samples in group k
             group_errors.append(1.0)
         else:
-            group_acc = (preds[mask_k] == y[mask_k]).float().mean().item()
-            group_errors.append(1.0 - group_acc)
+            if class_weights is not None:
+                # Weighted error
+                correct = (preds[mask_k] == y[mask_k]).float()
+                sample_w = get_sample_weights(y[mask_k], class_weights, device=eta.device)
+                group_acc = (correct * sample_w).sum() / sample_w.sum()
+                group_errors.append(1.0 - group_acc.item())
+            else:
+                # Unweighted error
+                group_acc = (preds[mask_k] == y[mask_k]).float().mean().item()
+                group_errors.append(1.0 - group_acc)
     
     return float(np.mean(group_errors)), group_errors
 
-def worst_error_on_S(eta, y, alpha, mu, c, class_to_group, K):
+def worst_error_on_S(eta, y, alpha, mu, c, class_to_group, K, class_weights=None):
     """
     Compute worst-group error rate on a split S.
+    
+    Args:
+        class_weights: Optional class frequency weights for evaluation reweighting
     
     Returns:
         worst_error: worst-group error (max of per-group errors)
@@ -184,8 +200,16 @@ def worst_error_on_S(eta, y, alpha, mu, c, class_to_group, K):
             # No accepted samples in group k
             group_errors.append(1.0)
         else:
-            group_acc = (preds[mask_k] == y[mask_k]).float().mean().item()
-            group_errors.append(1.0 - group_acc)
+            if class_weights is not None:
+                # Weighted error
+                correct = (preds[mask_k] == y[mask_k]).float()
+                sample_w = get_sample_weights(y[mask_k], class_weights, device=eta.device)
+                group_acc = (correct * sample_w).sum() / sample_w.sum()
+                group_errors.append(1.0 - group_acc.item())
+            else:
+                # Unweighted error
+                group_acc = (preds[mask_k] == y[mask_k]).float().mean().item()
+                group_errors.append(1.0 - group_acc)
     
     return float(max(group_errors)), group_errors
 
@@ -235,15 +259,18 @@ def worst_error_on_S_with_per_group_thresholds(eta, y, alpha, mu, t_group, class
     
     return float(max(group_errors)), group_errors
 
-def hybrid_error_on_S(eta, y, alpha, mu, c, class_to_group, K, beta=0.2):
+def hybrid_error_on_S(eta, y, alpha, mu, c, class_to_group, K, beta=0.2, class_weights=None):
     """
     Compute hybrid error: worst_error + beta * balanced_error
+    
+    Args:
+        class_weights: Optional class frequency weights for evaluation reweighting
     
     Returns:
         hybrid_error: worst + beta * balanced
         (worst_error, balanced_error): individual components
     """
-    worst_err, group_errs = worst_error_on_S(eta, y, alpha, mu, c, class_to_group, K)
+    worst_err, group_errs = worst_error_on_S(eta, y, alpha, mu, c, class_to_group, K, class_weights=class_weights)
     bal_err = float(np.mean(group_errs))
     
     hybrid_err = worst_err + beta * bal_err
@@ -350,7 +377,8 @@ def gse_balanced_plugin(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
                     c, M=10, lambda_grid=None,
                     alpha_init=None, gamma=0.3, cov_target=0.6, 
                     objective='balanced', hybrid_beta=0.2, alpha_steps=4,
-                    use_conditional_alpha=True, tie_break_balanced=True, use_ema_mu=True):
+                    use_conditional_alpha=True, tie_break_balanced=True, use_ema_mu=True,
+                    class_weights=None):
     """
     Main GSE-Balanced plugin algorithm with improved optimization strategies.
     
@@ -438,20 +466,20 @@ def gse_balanced_plugin(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
             # Evaluate on S2 with same t_cur according to objective
             if objective == 'worst':
                 error_score, group_errs = worst_error_on_S(
-                    eta_S2, y_S2, alpha_cur, mu, t_cur, class_to_group, K
+                    eta_S2, y_S2, alpha_cur, mu, t_cur, class_to_group, K, class_weights=class_weights
                 )
                 error_type = "worst"
                 # Also compute balanced for tie-breaking
                 balanced_score = float(np.mean(group_errs))
             elif objective == 'balanced':
                 error_score, group_errs = balanced_error_on_S(
-                    eta_S2, y_S2, alpha_cur, mu, t_cur, class_to_group, K
+                    eta_S2, y_S2, alpha_cur, mu, t_cur, class_to_group, K, class_weights=class_weights
                 )
                 error_type = "bal"
                 balanced_score = error_score
             elif objective == 'hybrid':
                 error_score, (worst_err, bal_err) = hybrid_error_on_S(
-                    eta_S2, y_S2, alpha_cur, mu, t_cur, class_to_group, K, hybrid_beta
+                    eta_S2, y_S2, alpha_cur, mu, t_cur, class_to_group, K, hybrid_beta, class_weights=class_weights
                 )
                 error_type = f"hybrid(w={worst_err:.3f},b={bal_err:.3f})"
                 balanced_score = bal_err
@@ -568,8 +596,23 @@ def main():
     
     # 1) Load data
     S1_loader, S2_loader = load_data_from_logits(CONFIG)
-    print(f"✅ Loaded S1 (tuneV): {len(S1_loader)} batches")
-    print(f"✅ Loaded S2 (val_lt): {len(S2_loader)} batches")
+    print(f"[OK] Loaded S1 (tuneV): {len(S1_loader)} batches")
+    print(f"[OK] Loaded S2 (val_lt): {len(S2_loader)} batches")
+    
+    # 1b) Load class weights for evaluation reweighting (if enabled)
+    class_weights = None
+    use_eval_reweight = CONFIG['dataset'].get('use_evaluation_reweighting', False)
+    
+    if use_eval_reweight:
+        try:
+            weights_info = load_train_class_weights(CONFIG['dataset']['splits_dir'])
+            class_weights = weights_info['class_weights']
+            print(f"[REWEIGHT] Loaded train class weights")
+            print(f"  Mode: {weights_info['mode']}")
+            print(f"  Head/Tail classes: {len(weights_info['head_classes'])}/{len(weights_info['tail_classes'])}")
+        except Exception as e:
+            print(f"[WARNING] Could not load class weights: {e}")
+            use_eval_reweight = False
     
     # 2) Set up grouping
     class_counts = get_cifar100_lt_counts(imb_factor=100)
@@ -760,6 +803,7 @@ def main():
             use_conditional_alpha=CONFIG['plugin_params']['use_conditional_alpha'],
             tie_break_balanced=CONFIG['plugin_params']['tie_break_balanced'],
             use_ema_mu=CONFIG['plugin_params'].get('use_ema_mu', True),
+            class_weights=class_weights,  # Pass class weights for evaluation reweighting
         )
         # If μ was frozen, overwrite with init μ
         if selective_loaded and CONFIG['plugin_params'].get('freeze_mu', False) and 'mu_init_tensor' in locals() and mu_init_tensor is not None:
