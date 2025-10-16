@@ -732,10 +732,10 @@ def create_full_cifar100_lt_splits(
     
     # 7. Save split indices to JSON
     splits = {
-        'train_indices': train_indices,
-        'val_lt_indices': val_indices,
-        'tuneV_indices': tunev_indices,
-        'test_lt_indices': test_indices
+        'train': train_indices,
+        'val_lt': val_indices,
+        'tuneV': tunev_indices,
+        'test_lt': test_indices
     }
     
     save_splits_to_json(splits, output_dir)
