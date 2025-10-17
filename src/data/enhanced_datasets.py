@@ -117,8 +117,8 @@ def create_longtail_train(cifar_train_dataset, imb_factor: float = 100, seed: in
 def create_proportional_test_val_with_duplication(
     cifar_test_dataset, 
     train_class_counts: List[int],
-    val_ratio: float = 0.2,
-    tunev_ratio: float = 0.15,
+    val_ratio: float = 0.1,  # 10% for validation
+    tunev_ratio: float = 0.1,  # 10% for tuneV
     seed: int = 42,
     create_balanced_test: bool = True
 ):
@@ -179,9 +179,9 @@ def create_proportional_test_val_with_duplication(
         # Calculate base split sizes (from 100 available per class)
         # Strategy: Maximize test base (since it's final evaluation), smaller val/tuneV bases
         # We'll use replication to match LT distribution (no downsampling)
-        n_val_base = max(1, int(round(100 * val_ratio)))       # 20 per class
-        n_tunev_base = max(1, int(round(100 * tunev_ratio)))   # 15 per class
-        n_test_base = max(1, 100 - n_val_base - n_tunev_base)  # 65 per class (majority for test)
+        n_val_base = max(1, int(round(100 * val_ratio)))       # 10 per class
+        n_tunev_base = max(1, int(round(100 * tunev_ratio)))   # 10 per class
+        n_test_base = max(1, 100 - n_val_base - n_tunev_base)  # 80 per class (majority for test)
         
         # Adjust if overflow
         if n_val_base + n_tunev_base + n_test_base > 100:
@@ -744,8 +744,8 @@ def save_statistics_to_csv(all_stats: Dict[str, Dict], output_dir: str):
 def create_full_cifar100_lt_splits(
     imb_factor: float = 100,
     output_dir: str = "data/cifar100_lt_if100_splits", 
-    val_ratio: float = 0.2,
-    tunev_ratio: float = 0.15,
+    val_ratio: float = 0.1,  # 10% for validation
+    tunev_ratio: float = 0.1,  # 10% for tuneV  
     seed: int = 42,
     create_balanced_test: bool = True,
     use_evaluation_reweighting: bool = False
@@ -766,8 +766,8 @@ def create_full_cifar100_lt_splits(
     Args:
         imb_factor: Imbalance factor for training set (default 100)
         output_dir: Directory to save split indices
-        val_ratio: Base proportion for validation (default 0.2)
-        tunev_ratio: Base proportion for tuneV (default 0.15)
+        val_ratio: Base proportion for validation (default 0.1 = 10%)
+        tunev_ratio: Base proportion for tuneV (default 0.1 = 10%)
         seed: Random seed for reproducibility
         create_balanced_test: Create additional balanced test set
         use_evaluation_reweighting: If True, keep val/tuneV/test balanced and use weighted metrics
@@ -808,9 +808,9 @@ def create_full_cifar100_lt_splits(
         cls_indices_in_test = np.where(test_targets_array == cls)[0]
         np.random.shuffle(cls_indices_in_test)
         
-        n_val_base = max(1, int(round(100 * val_ratio)))
-        n_tunev_base = max(1, int(round(100 * tunev_ratio)))
-        n_test_base = max(1, 100 - n_val_base - n_tunev_base)
+        n_val_base = max(1, int(round(100 * val_ratio)))       # 10 per class
+        n_tunev_base = max(1, int(round(100 * tunev_ratio)))   # 10 per class  
+        n_test_base = max(1, 100 - n_val_base - n_tunev_base)  # 80 per class
         
         if n_val_base + n_tunev_base + n_test_base > 100:
             n_test_base = 100 - n_val_base - n_tunev_base
@@ -997,8 +997,8 @@ if __name__ == "__main__":
     datasets, splits = create_full_cifar100_lt_splits(
         imb_factor=100,
         output_dir="data/cifar100_lt_if100_splits",
-        val_ratio=0.2,
-        tunev_ratio=0.15,
+        val_ratio=0.1,  # 10% for validation
+        tunev_ratio=0.1,  # 10% for tuneV
         seed=42,
         create_balanced_test=True  # Also create balanced test for robustness analysis
     )
